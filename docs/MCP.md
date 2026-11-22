@@ -1,0 +1,236 @@
+# MCP
+
+ImageLab exposes a Model Context Protocol server at `POST /mcp` using Streamable HTTP. It is implemented directly against JSON-RPC, so it works with any client that speaks the protocol.
+
+- Protocol versions: `2024-11-05`, `2025-03-26`, `2025-06-18`
+- Transport: HTTP POST, JSON responses (no SSE upgrade required)
+- Session: the `initialize` response includes `Mcp-Session-Id`; send it back on later calls
+- Auth: if `IMAGELAB_API_KEY` is set, send `Authorization: Bearer <key>` or `X-API-Key: <key>`
+
+## Client configuration
+
+### Claude Code
+
+```bash
+claude mcp add --transport http imagelab https://<machine>/mcp
+```
+
+With a key:
+
+```bash
+claude mcp add --transport http imagelab https://<machine>/mcp \
+  --header "Authorization: Bearer $IMAGELAB_API_KEY"
+```
+
+### JSON config (Cursor, Codex, others)
+
+```json
+{
+  "mcpServers": {
+    "imagelab": {
+      "type": "http",
+      "url": "https://<machine>/mcp",
+      "headers": {
+        "Authorization": "Bearer <API_KEY>"
+      }
+    }
+  }
+}
+```
+
+Omit `headers` when the server has no key.
+
+### Stdio-only clients
+
+```bash
+python -m gateway.mcp_stdio --url https://<machine>/mcp --key <API_KEY>
+```
+
+```json
+{
+  "mcpServers": {
+    "imagelab": {
+      "command": "python",
+      "args": ["-m", "gateway.mcp_stdio", "--url", "https://<machine>/mcp"]
+    }
+  }
+}
+```
+
+The bridge forwards newline-delimited JSON-RPC from stdin to the HTTP endpoint and prints the response. It keeps the `Mcp-Session-Id` for the lifetime of the process.
+
+## Handshake
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+  "protocolVersion":"2025-06-18",
+  "capabilities":{},
+  "clientInfo":{"name":"my-agent","version":"1.0"}
+}}
+```
+
+Response:
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{
+  "protocolVersion":"2025-06-18",
+  "capabilities":{
+    "tools":{"listChanged":false},
+    "resources":{"listChanged":false,"subscribe":false}
+  },
+  "serverInfo":{"name":"imagelab","version":"1.0.0"},
+  "instructions":"Kromoss image generation. Call generate_image; the PNG is returned inline and is deleted 300s after creation."
+}}
+```
+
+Then send `notifications/initialized` (the server answers `202 Accepted` with no body).
+
+## Tools
+
+### `generate_image`
+
+Queue a generation and optionally wait for it.
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+  "name":"generate_image",
+  "arguments":{
+    "prompt":"A tabby cat holding a sign that says KROMOSS, warm studio light, 85mm",
+    "width":512,
+    "height":512,
+    "steps":8,
+    "cfg":1,
+    "wait_seconds":120
+  }
+}}
+```
+
+| Argument | Type | Default | Notes |
+|---|---|---|---|
+| `prompt` | string | required | Natural language or a JSON layout prompt |
+| `negative_prompt` | string | server default | Only used when `cfg > 1` |
+| `width`, `height` | integer | 512 | 256–1024, multiple of 16 |
+| `steps` | integer | 8 | 4–16; 8 is the LoRA's training setting |
+| `cfg` | number | 1 | 1–10; above 1 costs a second text-encode pass |
+| `seed` | integer | random | Omit for a random seed |
+| `wait_seconds` | integer | 90 | 0–600; `0` returns immediately |
+
+The response always contains a text summary and `structuredContent`:
+
+```json
+{
+  "content": [
+    {"type":"text","text":"{\n  \"id\": \"img_…\",\n  \"status\": \"queued\", …\n}"},
+    {"type":"text","text":"Still queued. Call get_generation with id=img_… to poll."}
+  ],
+  "structuredContent": {
+    "id": "img_…",
+    "status": "queued",
+    "width": 512,
+    "height": 512,
+    "seed": 123456789,
+    "steps": 8,
+    "expires_at": null,
+    "expires_in": null,
+    "image_url": null,
+    "elapsed_seconds": 0.0
+  },
+  "isError": false
+}
+```
+
+When the image is ready, the response also carries the PNG:
+
+```json
+{
+  "content": [
+    {"type":"text","text":"{ …summary… }"},
+    {"type":"image","data":"iVBORw0KGgo…","mimeType":"image/png"},
+    {"type":"text","text":"The PNG is attached. It is deleted at 09:41:12 (287s from now); save it now."}
+  ],
+  "structuredContent": { "status": "succeeded", "expires_in": 287, "image_url": "/api/images/img_…" },
+  "isError": false
+}
+```
+
+**Agents must persist the bytes immediately.** Both the inline base64 and `image_url` point at a file that the reaper deletes five minutes after completion.
+
+### `get_generation`
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+  "name":"get_generation","arguments":{"id":"img_…"}
+}}
+```
+
+Returns the same shape as `generate_image`. If the job is still active, the text says so and includes the ID to poll. If the file expired, `status` is `expired` and no image content is returned.
+
+### `list_generations`
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+  "name":"list_generations","arguments":{"limit":10}
+}}
+```
+
+Returns a JSON array in both `content[0].text` and `structuredContent.generations`:
+
+```json
+[
+  {"id":"img_…","status":"succeeded","prompt":"A tabby cat…","width":512,"height":512,"expires_in":142},
+  {"id":"img_…","status":"expired","prompt":"…","width":512,"height":512,"expires_in":0}
+]
+```
+
+### `cancel_generation`
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
+  "name":"cancel_generation","arguments":{"id":"img_…"}
+}}
+```
+
+Cancels a queued or running job. Running jobs also interrupt ComfyUI.
+
+### `engine_info`
+
+No arguments. Returns the full `/api/health` payload: device, ComfyUI version, queue depth, counts, defaults, limits, model names and TTL.
+
+## Resources
+
+| URI | Content |
+|---|---|
+| `imagelab://engine` | Engine status JSON |
+| `imagelab://generations` | The 20 most recent job summaries |
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"imagelab://engine"}}
+```
+
+## Errors
+
+- Unknown tool: `isError: true` with a text explanation.
+- Empty prompt: `isError: true`, `"prompt is required"`.
+- Unknown job: `isError: true`, `"generation not found"`.
+- Unknown method: JSON-RPC error `-32601`.
+- Bad params: JSON-RPC error `-32602`.
+- Unauthorized: HTTP `401` before JSON-RPC handling.
+
+Tool failures are returned as successful JSON-RPC responses with `isError: true`, which is what MCP expects.
+
+## Agent playbook
+
+1. Call `engine_info` once. On CPU, expect minutes per image.
+2. Call `generate_image` with `512×512`, `8` steps, `cfg` `1`, and a `wait_seconds` of 60–120.
+3. If the status is `queued` or `running`, poll `get_generation` every 15–30 seconds. Do not start a second job unless you want to wait behind it — the engine is single-worker.
+4. On `succeeded`, write the base64 image to disk immediately. Mention the expiry to the user.
+5. Use the returned `seed` to reproduce or vary an image.
+6. Use `cancel_generation` if the user changes their mind; a CPU job can be long.
+
+## Protocol notes
+
+- `GET /mcp` returns `405`; this server does not offer a standalone SSE stream. POST is the only transport.
+- `DELETE /mcp` drops the session and returns `204`.
+- Batch requests (a JSON array) are supported.
+- Notifications (no `id`) return `202` with no body.
+- `ping` returns `{}`.
