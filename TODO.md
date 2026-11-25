@@ -4,7 +4,7 @@
 - [x] Check kube-labs CLI auth/backend state (signed in; backend recovered)
 - [x] List available images + measure real disk per image (spun up 1-unit test VMs of both, then deleted them)
 - [x] Give a recommendation backed by disk/RAM math → **docker-linux** (disk is tied to the image, not units)
-- [ ] Fold the playbook fixes into the repo (already present in uncommitted working tree: molbal GGUF node, `patch_comfy_moss_lora.py`, cloudflared tunnel unit, `remote_tunnel.sh`); 29 tests pass. Commit only when asked.
+- [x] Fold the playbook fixes into the repo — committed + pushed to `github.com/MahmoudMabrok/ImageLab` (branch `wip/styles-quality-live-progress`; molbal GGUF node, `patch_comfy_moss_lora.py`, cloudflared tunnel unit, `remote_tunnel.sh`, AGENTS.md, TODO.md); `make test` 33/33
 
 ## Completed
 
