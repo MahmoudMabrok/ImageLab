@@ -38,6 +38,11 @@ class FakeComfy:
         self.history: dict[str, dict[str, Any]] = {}
         self.connections: dict[str, list[WebSocket]] = {}
         self.interrupted = 0
+        # When > 0, the next N accepted prompts are silently dropped: the
+        # /prompt call returns a prompt_id but nothing runs — no queue entry,
+        # no history, no image. Models a workflow killed by an interrupt
+        # before (or right after) it reached the executor.
+        self.drop_next = 0
         self.app = self._build()
 
     def _build(self) -> FastAPI:
@@ -75,6 +80,10 @@ class FakeComfy:
         @app.post("/prompt")
         async def prompt(payload: dict[str, Any]) -> dict[str, Any]:
             prompt_id = uuid.uuid4().hex
+            # Silently drop: the call is accepted, but nothing runs.
+            if self.drop_next > 0:
+                self.drop_next -= 1
+                return {"prompt_id": prompt_id, "number": len(self.history) + 1}
             client_id = str(payload.get("client_id") or "")
             asyncio.create_task(self._run(prompt_id, client_id))
             return {"prompt_id": prompt_id, "number": len(self.history) + 1}

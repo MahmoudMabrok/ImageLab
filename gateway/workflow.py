@@ -22,6 +22,32 @@ NODE_SAMPLER = "8"
 NODE_DECODE = "9"
 NODE_SAVE = "10"
 
+# The style presets ("looks") as prompt wording. The UI keeps the idea and
+# the look as separate job fields (prompt + styles); this is the single
+# place that folds the selected looks back into the text encoder's prompt.
+STYLE_SUFFIXES = {
+    "cinematic": ", cinematic lighting, anamorphic lens, film still, dramatic contrast",
+    "photo": ", photorealistic, natural skin texture, 85mm lens, shallow depth of field",
+    "anime": ", anime-style digital illustration, clean linework, cel shading",
+    "product": ", product photography, seamless backdrop, softbox, crisp detail",
+    "poster": ", graphic poster design, bold typography, limited palette",
+    "illustration": ", editorial illustration, textured brushwork, muted palette",
+}
+
+
+def render_prompt(prompt: str, styles: str = "") -> str:
+    """The idea + the selected style presets, in the order they were chosen.
+
+    This is what the text encoder actually sees; the job stores the two
+    parts separately so the UI can show and restore them.
+    """
+    text = (prompt or "").strip()
+    for raw in (styles or "").split(","):
+        key = raw.strip()
+        if key in STYLE_SUFFIXES:
+            text = (text + STYLE_SUFFIXES[key]).strip()
+    return text.strip().lstrip(",").strip()
+
 
 def clamp_dimension(value: int, settings: Settings) -> int:
     value = int(value)

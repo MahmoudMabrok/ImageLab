@@ -2,7 +2,7 @@
 
 A small, self-hosted image generation studio for [Kromoss](https://huggingface.co/lodestones/Kromoss) — a 5B DiT fine-tune of MOSS-Image with a Qwen3.5-9B text encoder. It runs on your own machine, gives you a real UI, and exposes the same engine to AI agents over the Model Context Protocol.
 
-Every generated PNG is deleted **five minutes after it is ready**. That is the point: this is a sketchpad, not a gallery.
+Every generated PNG is deleted **five hours after it is ready**. That keeps the disk light: this is a working surface, not an archive.
 
 ```
 ┌──────────────────────────────┐        ┌──────────────────────────────┐
@@ -13,7 +13,7 @@ Every generated PNG is deleted **five minutes after it is ready**. That is the p
                ▼                                       ▼
       ┌────────────────────────────────────────────────────────┐
       │  FastAPI gateway :8080                                 │
-      │  queue · SQLite · SSE · 5-minute reaper · MCP at /mcp  │
+      │  queue · SQLite · SSE · 5-hour reaper · MCP at /mcp     │
       └───────────────────────────┬────────────────────────────┘
                                   │ HTTP + WebSocket
                                   ▼
@@ -26,9 +26,9 @@ Every generated PNG is deleted **five minutes after it is ready**. That is the p
 
 ## What you get
 
-- **A proper studio UI** — prompt composer, style presets, aspect ratios, quality tiers, live progress over SSE, download, cancel, delete-now, and a recent strip with countdowns.
-- **MCP for agents** — `generate_image`, `get_generation`, `list_generations`, `cancel_generation`, `engine_info`. Images come back inline as base64 and are also served over HTTP.
-- **Self-destructing images** — the reaper runs every two seconds and removes files whose TTL expired. Metadata is kept for a day so the UI can show what happened.
+- **A proper studio UI** — prompt composer, style presets, aspect ratios, quality tiers (each finished image remembers its look, tier and full recipe), live progress (SSE plus a 1 s poll of in-flight jobs, so it survives proxies/tunnels that swallow the SSE stream), download (or opt-in auto-download, remembered per browser), cancel, delete-now, and a recent strip with countdowns and one-click re-run.
+- **MCP for agents** — `generate_image`, `get_generation`, `cancel_generation`, `engine_info`. Images come back inline as base64 and are also served over HTTP. Agents only see the jobs they start (no listing endpoint).
+- **Self-destructing images** — the reaper runs every two seconds and removes files whose five-hour TTL expired. Metadata is kept for a day so the UI can show what happened.
 - **Two profiles** — a CPU profile that fits a kube-labs 8-unit machine, and a GPU INT8 profile for a real card.
 - **No front-end build step** — the UI is three static files served by the gateway.
 
@@ -45,6 +45,8 @@ Every generated PNG is deleted **five minutes after it is ready**. That is the p
 | Loader | `UnetLoaderGGUF` | `UNETLoader` |
 
 Why CPU uses GGUF: kube-labs machines are CPU-only (max 8 units = 8 vCPU / 16 GB RAM / 16 GB disk, no GPU). ggml Q4 kernels are the CPU-native path. The INT8 ConvRot file is built for CUDA/HIP — its int8 attention path has no CPU implementation, so it would be slower *and* it does not fit in 16 GB of disk alongside PyTorch and ComfyUI.
+
+The loader is [molbal's comfyui-gguf-reboot fork](https://github.com/molbal/ComfyUI-GGUF), not the stock city96 node pack. Kromoss GGUF files declare the `moss_image` architecture, which the stock loader rejects; the fork accepts it and keeps the `UnetLoaderGGUF` node name, so the workflow graph is unchanged.
 
 Set the profile with environment variables (`profiles/cpu-kube-labs.env` or `profiles/gpu-int8.env`), then restart the gateway.
 
@@ -65,7 +67,7 @@ make models MACHINE=kromoss
 # 4. Upload this repo and start both services
 make deploy MACHINE=kromoss
 
-# 5. Open the UI
+# 5. Publish the UI on a Cloudflare quick tunnel and print the URL
 make tunnel MACHINE=kromoss
 ```
 
@@ -98,6 +100,30 @@ kube-labs exec kromoss -- journalctl -u imagelab -n 100
 5. Download the PNG before the countdown reaches zero. **Delete now** removes it immediately.
 
 `Draft` (512 px) is the sensible default on CPU. `Balanced` (640 px) and `Detail` (768 px) scale pixels, and CPU time scales with them.
+
+## Public URL with Cloudflare
+
+`make tunnel MACHINE=kromoss` installs `cloudflared` on the machine, runs it as
+`imagelab-tunnel.service`, and prints the `https://<name>.trycloudflare.com`
+URL. It also writes that URL to `IMAGELAB_PUBLIC_URL` and restarts the gateway so
+generated links and MCP responses use the public host.
+
+A quick tunnel needs no Cloudflare account. The hostname is **ephemeral**: it
+changes whenever `imagelab-tunnel` restarts. For a stable hostname, create a
+named tunnel with `cloudflared tunnel login` and `cloudflared tunnel create`,
+then point its ingress at `http://127.0.0.1:8080`.
+
+The platform’s own URL (or a local port-forward) is still available with
+`make tunnel-platform MACHINE=kromoss`.
+
+```bash
+# On the machine
+systemctl status imagelab-tunnel
+journalctl -u imagelab-tunnel -n 50
+```
+
+Set `IMAGELAB_API_KEY` before publishing publicly. The quick tunnel is a real
+public listener; without a key, anyone with the hostname can generate images.
 
 ## Using MCP
 
@@ -135,12 +161,13 @@ Add `--key <API_KEY>` when the server has `IMAGELAB_API_KEY` set.
 | Tool | Arguments | Returns |
 |---|---|---|
 | `generate_image` | `prompt`, `width`, `height`, `steps`, `cfg`, `seed`, `negative_prompt`, `wait_seconds` | Job summary + PNG inline when ready |
-| `get_generation` | `id` | Job summary + PNG inline while alive |
-| `list_generations` | `limit` | Recent jobs with remaining lifetime |
+| `get_generation` | `id` | Your job by id, with live progress while running + PNG inline while alive |
 | `cancel_generation` | `id` | Updated status |
 | `engine_info` | — | Device, queue, defaults, limits, TTL |
 
-`generate_image` blocks for up to `wait_seconds` (default 90, max 600). On CPU, a job often exceeds that, so it returns `queued` or `running` and the agent polls `get_generation`. The tool text tells the agent to save the bytes immediately, because the URL dies with the file.
+`generate_image` blocks until the engine has the job, then for up to `wait_seconds` (default 90, max 600). On CPU, a job often exceeds that, so it returns `running` (with progress, step and ETA) and the agent polls `get_generation`. There is deliberately no listing tool — agents only ever see the jobs they started; cross-user history stays in the web UI and `GET /api/generations`. The tool text tells the agent to save the bytes immediately, because the URL dies with the file.
+
+**Over a Cloudflare quick tunnel, prefer `wait_seconds: 0`.** Quick tunnels cut off origin requests after 120 s (error 524); the job keeps running server-side, but the agent that blocked has no listing tool to recover the ID. With `wait_seconds: 0` the tool returns the id as soon as the engine has the job (sub-second), and the agent polls `get_generation` at its own pace. A tunnel restart changes the hostname, so a long-blocking call has a second chance to die.
 
 See [docs/MCP.md](docs/MCP.md) for raw JSON-RPC examples and the exact response shape.
 
@@ -183,7 +210,7 @@ Copy `.env.example` to `/etc/imagelab.env` on the machine (the deploy script doe
 | `IMAGELAB_VAE` | `flux2-vae_small.safetensors` | VAE |
 | `IMAGELAB_LORA` | `8-steps-dmd2-lora.safetensors` | Step-distilled LoRA |
 | `IMAGELAB_DEVICE_LABEL` | `CPU` | Shown in the UI |
-| `IMAGELAB_TTL_SECONDS` | `300` | Image lifetime after completion |
+| `IMAGELAB_TTL_SECONDS` | `18000` | Image lifetime after completion (5 hours) |
 | `IMAGELAB_JOB_TIMEOUT` | `3600` | Hard per-job timeout |
 | `IMAGELAB_DEFAULT_WIDTH/HEIGHT` | `512` | Defaults |
 | `IMAGELAB_DEFAULT_STEPS` | `8` | Defaults |
@@ -211,8 +238,9 @@ The countdown in the UI is computed from `expires_in` plus local elapsed time, s
 
 CPU generation is the whole story on kube-labs. With 8 vCPU and the Q4 GGUF transformer:
 
-- 512×512, 8 steps: **roughly ten minutes** per image including the first text-encode pass.
-- 640×640: ~1.6× the pixels, so noticeably longer.
+- 256×256, 8 steps: **measured 215.6 s** (≈ 3.6 min) on kromoss, including the one-time model load (3.6 GB GGUF transformer + 9 B text encoder). Sampling alone is the bulk of that after warm-up.
+- 512×512, 8 steps: 4× the pixels, expect roughly ten minutes including any model load.
+- 640×640: ~1.6× the pixels of 512, so noticeably longer.
 - 768×768 and above: tens of minutes. Use it for a final pass, not iteration.
 
 The ETA in the UI is a calibrated guess until real jobs complete; after that it uses observed progress. Run `make trial` to measure your machine and adjust `IMAGELAB_ETA_SCALE`.
@@ -223,7 +251,7 @@ On a 24 GB GPU with the INT8 profile, the same settings are interactive (seconds
 
 ```bash
 make install     # venv + dev dependencies
-make test        # 26 tests: graph, store, MCP, engine e2e, API e2e
+make test        # 29 tests: graph, store, MCP, engine e2e, API e2e
 make run         # gateway on :8080 (expects ComfyUI at :8188)
 ```
 
@@ -242,7 +270,7 @@ gateway/
 web/            the UI (no build step)
 scripts/        provisioning, deploy, tunnel, trial
 profiles/       CPU and GPU environment profiles
-systemd/        comfyui.service, imagelab.service
+systemd/        comfyui.service, imagelab.service, imagelab-tunnel.service
 tests/          pytest suite
 ```
 
@@ -256,9 +284,15 @@ More detail in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 **`ComfyUI rejected the workflow`.** The node names or file names do not match the installed ComfyUI. Confirm the GGUF custom node is present (`custom_nodes/ComfyUI-GGUF`) and that `models/diffusion_models/kromoss-Q4_K_M.gguf` exists.
 
+**`Unexpected architecture type in GGUF file: 'moss_image'`.** The stock city96 loader is installed. Re-run `make setup` (or clone [molbal/ComfyUI-GGUF](https://github.com/molbal/ComfyUI-GGUF)) and restart ComfyUI.
+
+**`start (0) + length (...) exceeds dimension size (...)`.** ComfyUI is mapping the MOSS-Image LoRA onto a GGUF model without the fused-qkv fix. Run `python3 scripts/patch_comfy_moss_lora.py /srv/ComfyUI/comfy/lora.py` and restart ComfyUI (`make setup` applies it automatically).
+
+**MCP call over the tunnel dies with Cloudflare error 524.** Quick tunnels cut origin requests at 120 s. The generation keeps running server-side, but the blocked client has no listing tool to recover the job id. Use `wait_seconds: 0` and poll `get_generation` (see [docs/MCP.md](docs/MCP.md)).
+
 **Out of disk.** `df -h /`. The CPU profile needs ~11.7 GB of weights plus ~1.5 GB for Python (the fp32 LoRA is converted to fp16 automatically by `remote_models.sh`). If you are still tight, the next lever is a smaller text-encoder quant; the GGUF node accepts `qwen3`/`qwen3vl` text encoders as well.
 
-**Images disappear too fast.** That is the product. Download or copy them before the countdown ends; the TTL is `IMAGELAB_TTL_SECONDS`.
+**Images vanish before you saved them.** Five hours is a long time, but the TTL is `IMAGELAB_TTL_SECONDS` — lower it for ephemeral hosts, or turn on auto-download in the UI.
 
 ## Model and license
 
@@ -267,4 +301,4 @@ Kromoss is published by [lodestones](https://huggingface.co/lodestones/Kromoss) 
 ## Status
 
 - Gateway, UI, MCP server, tests, and deployment scripts are complete.
-- The kube-labs backend was in database recovery during the last remote run, so the CPU latency figure above is an estimate. `make trial` prints the real number and writes `out.png`.
+- Verified end to end on kromoss (2026-11-24): a 256×256, 8-step generation submitted over the public Cloudflare URL with MCP completed in 215.6 s and returned a valid PNG; the UI, REST, and MCP endpoints all answer over the tunnel.

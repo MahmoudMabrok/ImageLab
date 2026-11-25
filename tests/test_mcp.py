@@ -1,4 +1,4 @@
-"""MCP surface: handshake, tool discovery, validation and queueing."""
+"""MCP surface: handshake, tool discovery, validation and waiting."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from gateway.config import Settings
 from gateway.engine import Engine
 from gateway.mcp_http import McpServer, build_tools
 from gateway.store import Store
+
+from .fake_comfy import FakeComfyServer
 
 
 def make_settings(tmp_path) -> Settings:
@@ -29,6 +31,29 @@ def server(tmp_path):
     engine = Engine(settings, store)
     yield McpServer(settings, engine)
     store.close()
+
+
+@pytest.fixture()
+async def live_server(tmp_path):
+    """MCP server against a started engine and a fake ComfyUI that accepts a
+    prompt and then samples forever, so jobs sit in "running"."""
+    output = tmp_path / "comfy-output"
+    output.mkdir()
+    with FakeComfyServer(output, duration=3600, steps=1) as fake:
+        settings = dataclasses.replace(
+            Settings(),
+            data_dir=tmp_path / "data",
+            comfy_url=fake.url,
+            comfy_output_dir=output,
+            public_url="https://example.test",
+            api_key="",
+        )
+        store = Store(settings.db_path)
+        engine = Engine(settings, store)
+        await engine.start()
+        yield McpServer(settings, engine)
+        await engine.stop()
+        store.close()
 
 
 async def test_initialize_returns_a_session(server):
@@ -60,10 +85,33 @@ async def test_tools_list_exposes_the_generation_surface(server):
     assert names == {
         "generate_image",
         "get_generation",
-        "list_generations",
         "cancel_generation",
         "engine_info",
     }
+    # No listing tool: other clients must not be able to read other
+    # generations, only their own (by id).
+    assert "list_generations" not in names
+
+
+async def test_resources_list_has_no_generation_listing(server):
+    result, _ = await server.handle(
+        {"jsonrpc": "2.0", "id": 2, "method": "resources/list", "params": {}}, None
+    )
+    assert result is not None
+    uris = {resource["uri"] for resource in result["result"]["resources"]}
+    assert "imagelab://generations" not in uris
+
+    read, _ = await server.handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "resources/read",
+            "params": {"uri": "imagelab://generations"},
+        },
+        None,
+    )
+    assert read is not None
+    assert read["error"]["code"] == -32602
 
 
 async def test_generate_requires_a_prompt(server):
@@ -81,8 +129,14 @@ async def test_generate_requires_a_prompt(server):
     assert "prompt" in result["result"]["content"][0]["text"]
 
 
-async def test_generate_queues_a_job_without_blocking(server):
-    result, _ = await server.handle(
+async def test_generate_returns_no_earlier_than_a_running_engine(live_server):
+    """wait_seconds=0 must not hand back a job the engine does not hold: the
+    engine is single-worker and takes a job within ~0.4 s, so the answer has
+    to be "running" (or later), never "queued"."""
+    import time as _time
+
+    t0 = _time.time()
+    result, _ = await live_server.handle(
         {
             "jsonrpc": "2.0",
             "id": 4,
@@ -98,9 +152,16 @@ async def test_generate_queues_a_job_without_blocking(server):
     payload = result["result"]
     assert payload["isError"] is False
     summary = payload["structuredContent"]
-    assert summary["status"] == "queued"
+    assert summary["status"] == "running", summary
+    # No one is ahead; the count includes the running job itself.
+    assert summary["queue_position"] == 1
+    assert "id=img_" in payload["content"][-1]["text"]
     assert summary["id"].startswith("img_")
-    assert server.engine.store.get(summary["id"]) is not None
+    assert live_server.engine.store.get(summary["id"]) is not None
+    # It waited for the engine to take the job instead of returning instantly.
+    assert _time.time() - t0 >= 0.2
+    # Clean up so the fixture's engine.stop() has nothing to cancel.
+    await live_server.engine.cancel(summary["id"])
 
 
 async def test_unknown_method_is_a_jsonrpc_error(server):

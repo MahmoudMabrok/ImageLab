@@ -92,6 +92,8 @@ class GenerateRequest(BaseModel):
     cfg: float | None = None
     seed: int | None = None
     lora_strength: float | None = None
+    styles: str | None = None
+    quality: str | None = None
 
 
 @app.get("/api/health")
@@ -127,6 +129,8 @@ async def generate(body: GenerateRequest) -> dict[str, Any]:
             seed=body.seed,
             lora_strength=body.lora_strength,
             source="web",
+            styles=body.styles or "",
+            quality=body.quality or None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

@@ -72,13 +72,21 @@ fi
 log "Installing ComfyUI requirements"
 pip install --no-cache-dir --quiet -r requirements.txt
 
-log "Installing GGUF loader (city96/ComfyUI-GGUF)"
-if [ ! -d custom_nodes/ComfyUI-GGUF/nodes.py ]; then
-  rm -rf custom_nodes/ComfyUI-GGUF
-  git clone --depth 1 https://github.com/city96/ComfyUI-GGUF.git custom_nodes/ComfyUI-GGUF
+# The stock city96 loader rejects the `moss_image` GGUF architecture. molbal's
+# fork ("comfyui-gguf-reboot") is the loader the Kromoss GGUF model card asks
+# for; the legacy UnetLoaderGGUF node name is unchanged, so the graph works.
+log "Installing GGUF loader (molbal/ComfyUI-GGUF, moss_image support)"
+GGUF_DIR=custom_nodes/ComfyUI-GGUF
+if ! grep -q "UnetLoaderGGUFDynamicVRAM" "$GGUF_DIR/nodes.py" 2>/dev/null; then
+  rm -rf "$GGUF_DIR"
+  git clone --depth 1 https://github.com/molbal/ComfyUI-GGUF.git "$GGUF_DIR"
 fi
-rm -rf custom_nodes/ComfyUI-GGUF/.git
-pip install --no-cache-dir --quiet gguf sentencepiece
+rm -rf "$GGUF_DIR/.git"
+pip install --no-cache-dir --quiet -r "$GGUF_DIR/requirements.txt"
+
+# ComfyUI's MOSS-Image LoRA map derives the fused-qkv slice width from the
+# tensor shape; GGUF state dicts are packed 1-D. Use the unet config instead.
+python3 "$(dirname "$0")/patch_comfy_moss_lora.py" "$COMFY_DIR/comfy/lora.py"
 
 log "Preparing model folders"
 mkdir -p models/diffusion_models models/text_encoders models/vae models/loras output

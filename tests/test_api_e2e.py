@@ -36,10 +36,11 @@ def wait_for(url: str, timeout: float = 30) -> None:
 
 
 @pytest.fixture()
-def stack(tmp_path):
+def stack(tmp_path, request):
     output = tmp_path / "comfy-output"
     output.mkdir()
-    with FakeComfyServer(output, duration=0.6) as fake:
+    duration = float(getattr(request, "param", 0.6))
+    with FakeComfyServer(output, duration=duration) as fake:
         port = free_port()
         env = {
             **os.environ,
@@ -79,8 +80,15 @@ def test_ui_and_config_are_served(stack):
     ui = httpx.get(base + "/")
     assert ui.status_code == 200
     assert "Kromoss Studio" in ui.text
+    # The auto-download preference toggle ships in the served page
+    # (opt-in by default; the choice persists in the browser).
+    assert 'id="auto-download"' in ui.text
+    assert "Auto-download finished images" in ui.text
+    # Five-hour TTL copy (the 5-minute phrasing is gone).
+    assert "Images are deleted 5 hours after they are ready." in ui.text
+    assert "five minutes" not in ui.text
     config = httpx.get(base + "/api/config").json()
-    assert config["ttl_seconds"] == 3
+    assert config["ttl_seconds"] == 3  # fixture overrides IMAGELAB_TTL_SECONDS
     assert config["mcp"]["http"].endswith("/mcp")
 
 
@@ -189,3 +197,95 @@ def test_mcp_over_http_returns_the_png(stack):
         },
     ).json()
     assert poll["result"]["structuredContent"]["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("stack", [4.0], indirect=True)
+def test_mcp_default_generate_waits_through_a_slow_512(stack):
+    """Defaults are 512x512; the call must hold until the engine has the job
+    and then wait for the PNG — never hand back a "queued" status."""
+    base, _ = stack
+    headers = {"Accept": "application/json, text/event-stream"}
+    init = httpx.post(
+        base + "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "0"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = init.headers["mcp-session-id"]
+
+    started = time.time()
+    call = httpx.post(
+        base + "/mcp", headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "generate_image",
+                "arguments": {"prompt": "a lighthouse", "wait_seconds": 30},
+            },
+        },
+        timeout=60,
+    ).json()
+    elapsed = time.time() - started
+    result = call["result"]
+    assert result["isError"] is False, result
+    summary = result["structuredContent"]
+    assert summary["status"] == "succeeded", summary
+    # Server defaults are 512x512, 8 steps.
+    assert (summary["width"], summary["height"], summary["steps"]) == (512, 512, 8)
+    # The call held for the whole generation (~4 s fake duration), it did not
+    # return early with a queued/running status.
+    assert elapsed >= 3.0, elapsed
+    for block in result["content"]:
+        if block["type"] == "text":
+            assert "queued" not in block["text"]
+    images = [c for c in result["content"] if c["type"] == "image"]
+    assert images, result
+    assert base64.b64decode(images[0]["data"]).startswith(b"\x89PNG")
+
+
+def test_rest_listing_endpoint_is_kept_for_the_web_ui(stack):
+    base, _ = stack
+    httpx.post(
+        base + "/api/generate",
+        json={"prompt": "a cat", "width": 512, "height": 512, "steps": 8},
+        timeout=10,
+    )
+    data = httpx.get(base + "/api/generations?limit=24", timeout=10).json()
+    assert data["generations"], data
+    assert data["generations"][0]["prompt"] == "a cat"
+
+
+def test_generate_persists_style_look_and_quality_tier(stack):
+    base, _ = stack
+    job = httpx.post(
+        base + "/api/generate",
+        json={
+            "prompt": "a lighthouse",
+            "width": 768,
+            "height": 768,
+            "steps": 8,
+            "cfg": 1,
+            "styles": "cinematic,photo",
+            "quality": "detail",
+        },
+        timeout=10,
+    ).json()
+    # The look and the tier travel with the job, not just as prompt text.
+    assert job["styles"] == "cinematic,photo"
+    assert job["quality"] == "detail"
+    current = httpx.get(base + f"/api/generations/{job['id']}", timeout=10).json()
+    assert current["styles"] == "cinematic,photo"
+    assert current["quality"] == "detail"
+    listed = httpx.get(base + "/api/generations?limit=24", timeout=10).json()
+    assert listed["generations"][0]["styles"] == "cinematic,photo"
+    assert listed["generations"][0]["quality"] == "detail"

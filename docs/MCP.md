@@ -79,7 +79,7 @@ Response:
     "resources":{"listChanged":false,"subscribe":false}
   },
   "serverInfo":{"name":"imagelab","version":"1.0.0"},
-  "instructions":"Kromoss image generation. Call generate_image; the PNG is returned inline and is deleted 300s after creation."
+  "instructions":"Kromoss image generation. Call generate_image; the PNG is returned inline and is deleted 18000s after creation."
 }}
 ```
 
@@ -113,19 +113,19 @@ Queue a generation and optionally wait for it.
 | `steps` | integer | 8 | 4–16; 8 is the LoRA's training setting |
 | `cfg` | number | 1 | 1–10; above 1 costs a second text-encode pass |
 | `seed` | integer | random | Omit for a random seed |
-| `wait_seconds` | integer | 90 | 0–600; `0` returns immediately |
+| `wait_seconds` | integer | 90 | 0–600; the call first holds until the engine has the job, then spends this budget waiting for completion |
 
-The response always contains a text summary and `structuredContent`:
+The response always contains a text summary and `structuredContent`. The status is never `queued`: the call returns only once the engine has taken the job, so agents see `running` (with `progress`, `step`, `step_total`, `queue_position`, `eta_seconds`) or a terminal status. With `wait_seconds: 0` the id comes back as soon as the engine has the job.
 
 ```json
 {
   "content": [
-    {"type":"text","text":"{\n  \"id\": \"img_…\",\n  \"status\": \"queued\", …\n}"},
-    {"type":"text","text":"Still queued. Call get_generation with id=img_… to poll."}
+    {"type":"text","text":"{\n  \"id\": \"img_…\",\n  \"status\": \"running\", …\n}"},
+    {"type":"text","text":"Still running — progress, step and ETA are in the summary above. Call get_generation with id=img_… to keep checking."}
   ],
   "structuredContent": {
     "id": "img_…",
-    "status": "queued",
+    "status": "running",
     "width": 512,
     "height": 512,
     "seed": 123456789,
@@ -133,7 +133,12 @@ The response always contains a text summary and `structuredContent`:
     "expires_at": null,
     "expires_in": null,
     "image_url": null,
-    "elapsed_seconds": 0.0
+    "elapsed_seconds": 3.2,
+    "queue_position": 0,
+    "eta_seconds": 512,
+    "progress": 0.125,
+    "step": 1,
+    "step_total": 8
   },
   "isError": false
 }
@@ -153,7 +158,7 @@ When the image is ready, the response also carries the PNG:
 }
 ```
 
-**Agents must persist the bytes immediately.** Both the inline base64 and `image_url` point at a file that the reaper deletes five minutes after completion.
+**Agents must persist the bytes immediately.** Both the inline base64 and `image_url` point at a file that the reaper deletes five hours after completion.
 
 ### `get_generation`
 
@@ -163,29 +168,14 @@ When the image is ready, the response also carries the PNG:
 }}
 ```
 
-Returns the same shape as `generate_image`. If the job is still active, the text says so and includes the ID to poll. If the file expired, `status` is `expired` and no image content is returned.
+Returns the same shape as `generate_image`. While the job is still active the summary carries live `progress`, `step`, `step_total`, `queue_position` and `eta_seconds`. If the file expired, `status` is `expired` and no image content is returned.
 
-### `list_generations`
-
-```json
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
-  "name":"list_generations","arguments":{"limit":10}
-}}
-```
-
-Returns a JSON array in both `content[0].text` and `structuredContent.generations`:
-
-```json
-[
-  {"id":"img_…","status":"succeeded","prompt":"A tabby cat…","width":512,"height":512,"expires_in":142},
-  {"id":"img_…","status":"expired","prompt":"…","width":512,"height":512,"expires_in":0}
-]
-```
+There is deliberately no tool to list generations. This server is a shared engine: agents can only ever read the jobs they started (by the id `generate_image` returned them). Other users' history is not exposed over MCP — it stays in the web UI and the plain REST `GET /api/generations`.
 
 ### `cancel_generation`
 
 ```json
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
   "name":"cancel_generation","arguments":{"id":"img_…"}
 }}
 ```
@@ -201,11 +191,23 @@ No arguments. Returns the full `/api/health` payload: device, ComfyUI version, q
 | URI | Content |
 |---|---|
 | `imagelab://engine` | Engine status JSON |
-| `imagelab://generations` | The 20 most recent job summaries |
 
 ```json
 {"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"imagelab://engine"}}
 ```
+
+## Long-running calls behind a tunnel
+
+Cloudflare quick tunnels time out the origin after **120 s** (HTTP 524). The
+generation keeps running server-side, but a client still blocked inside
+`generate_image` never learns the job id — and there is no listing tool to
+recover it from. So behind a tunnel:
+
+1. Call `generate_image` with `wait_seconds: 0`. It returns the id as soon as
+   the engine has the job (sub-second in practice).
+2. Poll `get_generation` every 15–30 s until `succeeded`; the summary carries
+   progress, step and ETA, so the agent knows the job is alive.
+3. Direct (non-tunnel) calls may use the full `wait_seconds` budget.
 
 ## Errors
 
@@ -222,7 +224,7 @@ Tool failures are returned as successful JSON-RPC responses with `isError: true`
 
 1. Call `engine_info` once. On CPU, expect minutes per image.
 2. Call `generate_image` with `512×512`, `8` steps, `cfg` `1`, and a `wait_seconds` of 60–120.
-3. If the status is `queued` or `running`, poll `get_generation` every 15–30 seconds. Do not start a second job unless you want to wait behind it — the engine is single-worker.
+3. If the status is `running`, poll `get_generation` every 15–30 seconds; the summary carries live progress and an ETA. Do not start a second job unless you want to wait behind it — the engine is single-worker.
 4. On `succeeded`, write the base64 image to disk immediately. Mention the expiry to the user.
 5. Use the returned `seed` to reproduce or vary an image.
 6. Use `cancel_generation` if the user changes their mind; a CPU job can be long.

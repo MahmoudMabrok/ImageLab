@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse, Response
 
 from .config import Settings
 from .engine import Engine
+from .store import ACTIVE
 
 PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
 LATEST = PROTOCOL_VERSIONS[-1]
@@ -61,9 +62,10 @@ def build_tools(settings: Settings) -> list[dict[str, Any]]:
             (
                 "Generate an image with Kromoss (MOSS-Image fine-tune). Images self-destruct "
                 f"{settings.ttl_seconds} seconds after they are ready. This call waits for the "
-                "result when wait_seconds allows and returns the PNG inline as image content. "
-                f"This engine is {settings.device_label}; expect slow generations and prefer "
-                "512x512 with 8 steps."
+                "result when wait_seconds allows and returns the PNG inline as image content; "
+                "call get_generation with the id to keep checking. wait_seconds=0 returns the "
+                "id as soon as the engine has the job. This engine is single-worker and "
+                f"{settings.device_label}; expect slow generations and prefer 512x512 with 8 steps."
             ),
             {
                 "type": "object",
@@ -123,17 +125,6 @@ def build_tools(settings: Settings) -> list[dict[str, Any]]:
             IMAGE_OUTPUT,
         ),
         _tool(
-            "list_generations",
-            "List recent generations with status and remaining lifetime.",
-            {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}
-                },
-                "additionalProperties": False,
-            },
-        ),
-        _tool(
             "cancel_generation",
             "Cancel a queued or running generation.",
             {
@@ -174,7 +165,7 @@ class McpServer:
         return [{"type": "image", "data": data, "mimeType": "image/png"}]
 
     def _summary(self, job: dict[str, Any]) -> dict[str, Any]:
-        return {
+        out = {
             "id": job["id"],
             "status": job["status"],
             "width": job["width"],
@@ -190,6 +181,16 @@ class McpServer:
                 1,
             ),
         }
+        if job["status"] in ACTIVE:
+            out["queue_position"] = self.engine.store.queue_position(job["id"])
+            out["eta_seconds"] = self.engine._eta(job)
+            if job["status"] == "running":
+                out["progress"] = round(float(job.get("progress") or 0.0), 3)
+                out["step"] = int(job.get("step") or 0)
+                out["step_total"] = int(job.get("total_steps") or job["steps"])
+        if job["status"] == "failed" and job.get("error"):
+            out["error"] = job["error"]
+        return out
 
     async def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "generate_image":
@@ -207,37 +208,25 @@ class McpServer:
                 lora_strength=None,
                 source="mcp",
             )
-            wait = max(0, min(self.settings.mcp_wait_max, int(args.get("wait_seconds", self.settings.mcp_wait_default))))
-            job = await self.engine.wait(job["id"], wait) or job
-            return self._job_response(job, queued_note=wait > 0)
+            wait = max(
+                0, min(self.settings.mcp_wait_max, int(args.get("wait_seconds", self.settings.mcp_wait_default)))
+            )
+            # Hold the call until the engine actually has the job so the
+            # summary never reports "queued"; 60s caps a hung engine.
+            took = time.time()
+            while job["status"] == "queued" and time.time() - took < 60:
+                job = await self.engine.wait(job["id"], min(5.0, 60.0 - (time.time() - took))) or job
+            # Then spend the requested budget waiting for completion.
+            remaining = wait - (time.time() - took)
+            if remaining > 0 and job["status"] in ACTIVE:
+                job = await self.engine.wait(job["id"], remaining) or job
+            return self._job_response(job)
 
         if name == "get_generation":
             job = self.engine.store.get(str(args.get("id") or ""))
             if job is None:
                 return self._tool_error("generation not found")
-            return self._job_response(job, queued_note=False)
-
-        if name == "list_generations":
-            limit = max(1, min(50, int(args.get("limit") or 10)))
-            jobs = self.engine.store.list(limit)
-            rows = [
-                {
-                    "id": j["id"],
-                    "status": j["status"],
-                    "prompt": j["prompt"][:160],
-                    "width": j["width"],
-                    "height": j["height"],
-                    "expires_in": j.get("expires_in"),
-                }
-                for j in jobs
-            ]
-            return {
-                "content": [
-                    {"type": "text", "text": json.dumps(rows, indent=2)},
-                ],
-                "structuredContent": {"generations": rows},
-                "isError": False,
-            }
+            return self._job_response(job)
 
         if name == "cancel_generation":
             job = await self.engine.cancel(str(args.get("id") or ""))
@@ -265,7 +254,7 @@ class McpServer:
             "isError": True,
         }
 
-    def _job_response(self, job: dict[str, Any], *, queued_note: bool) -> dict[str, Any]:
+    def _job_response(self, job: dict[str, Any]) -> dict[str, Any]:
         summary = self._summary(job)
         content: list[dict[str, Any]] = [
             {"type": "text", "text": json.dumps(summary, indent=2)}
@@ -281,12 +270,13 @@ class McpServer:
                     ),
                 }
             )
-        elif job["status"] in ("queued", "running") and queued_note:
+        elif job["status"] in ACTIVE:
             content.append(
                 {
                     "type": "text",
                     "text": (
-                        f"Still {job['status']}. Call get_generation with id={job['id']} to poll."
+                        f"Still {job['status']} — progress, step and ETA are in the summary above. "
+                        f"Call get_generation with id={job['id']} to keep checking."
                     ),
                 }
             )
@@ -356,11 +346,6 @@ class McpServer:
                                 "name": "Engine status",
                                 "mimeType": "application/json",
                             },
-                            {
-                                "uri": "imagelab://generations",
-                                "name": "Recent generations",
-                                "mimeType": "application/json",
-                            },
                         ]
                     },
                 ),
@@ -371,8 +356,6 @@ class McpServer:
             uri = str(params.get("uri") or "")
             if uri == "imagelab://engine":
                 body = self.engine.status()
-            elif uri == "imagelab://generations":
-                body = {"generations": [self._summary(j) for j in self.engine.store.list(20)]}
             else:
                 return _error(request_id, -32602, f"unknown resource: {uri}"), headers
             return (

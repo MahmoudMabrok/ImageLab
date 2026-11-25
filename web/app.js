@@ -16,6 +16,23 @@
 
   const QUALITY = { draft: 512, balanced: 640, detail: 768 };
 
+  const STYLE_LABEL = {
+    cinematic: "Cinematic",
+    photo: "Photoreal",
+    anime: "Anime",
+    product: "Product",
+    poster: "Poster",
+    illustration: "Illustration",
+  };
+
+  // The style presets the user picked for a job, as stored on the job
+  // (comma list) — shown on the result and the Recent cards.
+  function styleLabels(job) {
+    return (job.styles || "")
+      .split(",").map((s) => s.trim()).filter(Boolean)
+      .map((s) => STYLE_LABEL[s] || s);
+  }
+
   const SURPRISES = [
     "A tabby cat holding a sign that says KROMOSS, warm studio light, 85mm, shallow depth of field",
     "An editorial photograph of a model in a structured ivory wool coat against a seamless warm grey backdrop, single softbox from the left, muted cream and charcoal palette, subtle film grain",
@@ -40,8 +57,44 @@
     key: localStorage.getItem("imagelab.key") || "",
     es: null,
     failedConnects: 0,
+    // Timestamp of the last real SSE event received. A quick-tunnel can hold
+    // the stream open without delivering a single byte, so "connected" is not
+    // proof that events are flowing; freshness is judged on data, not on the
+    // socket state.
+    lastEventAt: 0,
     seenExpired: new Set(),
+    // Persisted browser preference (key: imagelab.autoDownload). "1" = on.
+    autoDownload: localStorage.getItem("imagelab.autoDownload") === "1",
+    // Jobs whose finished image still needs saving while a download is in
+    // flight (or the tab reloaded mid-download).
+    autoDownloadPending: new Set(),
+    // Jobs already auto-saved (per job id, so a reconnect/snapshot never
+    // saves the same image twice). Persisted and trimmed.
+    autoDownloadSaved: new Set(
+      safeJsonList(localStorage.getItem("imagelab.autoDownloadSaved"))
+    ),
+    autoDownloadDraining: false,
   };
+
+  function safeJsonList(raw) {
+    try {
+      const value = JSON.parse(raw || "[]");
+      return Array.isArray(value) ? value : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function persistAutoDownloadLists() {
+    localStorage.setItem(
+      "imagelab.autoDownloadPending",
+      JSON.stringify([...state.autoDownloadPending])
+    );
+    localStorage.setItem(
+      "imagelab.autoDownloadSaved",
+      JSON.stringify([...state.autoDownloadSaved].slice(-20))
+    );
+  }
 
   // ---------------------------------------------------------------- utils
   function toast(message, kind = "") {
@@ -60,9 +113,31 @@
 
   function fmtClock(seconds) {
     seconds = Math.max(0, Math.round(seconds));
-    const m = Math.floor(seconds / 60);
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
     const s = seconds % 60;
-    return `${m}:${String(s).padStart(2, "0")}`;
+    return h > 0
+      ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+      : `${m}:${String(s).padStart(2, "0")}`;
+  }
+
+  // Everything needed to re-run a job is here: frame, steps, cfg, seed,
+  // LoRA — plus the look (style presets) and the quality tier, which used
+  // to be lost (baked into the prompt text / only the pixel count).
+  function buildDetails(job) {
+    const parts = [`${job.width}×${job.height}`, `${job.steps} steps`, `cfg ${job.cfg}`];
+    if (Number.isInteger(job.seed)) parts.push(`seed ${job.seed}`);
+    if (job.lora_strength && job.lora_strength !== 1) parts.push(`LoRA ${job.lora_strength}`);
+    if (job.quality) parts.push(job.quality);
+    const looks = styleLabels(job);
+    if (looks.length) parts.push(looks.join("+"));
+    return parts.join(" · ");
+  }
+
+  function generateNoteText() {
+    return state.autoDownload
+      ? "Images are deleted 5 hours after they are ready — with auto-download on, finished images save to your browser."
+      : "Images are deleted 5 hours after they are ready.";
   }
 
   function fmtDuration(seconds) {
@@ -128,12 +203,6 @@
     return { width, height };
   }
 
-  function composedPrompt() {
-    const base = $("#prompt").value.trim();
-    const suffix = [...state.styles].map((s) => STYLE_SUFFIX[s]).join("");
-    return (base + suffix).trim();
-  }
-
   // ---------------------------------------------------------------- render
   function renderEngine() {
     const dot = $("#engine-dot");
@@ -174,9 +243,15 @@
 
   function jobReceived(job) {
     job._recv = Date.now();
+    const previous = state.jobs.get(job.id);
     state.jobs.set(job.id, job);
     if (!state.activeId && (job.status === "queued" || job.status === "running")) {
       state.activeId = job.id;
+    }
+    // Succeeded is terminal and can be observed late (SSE reconnect,
+    // /api/generations poll) — pick the auto-save up in any case.
+    if (job.status === "succeeded" && previous?.status !== "succeeded") {
+      queueAutoDownload(job);
     }
   }
 
@@ -246,8 +321,10 @@
       $("#result-prompt").textContent = job.prompt;
       const seconds =
         job.finished_at && job.started_at ? job.finished_at - job.started_at : null;
+      const meta = [`${job.quality || ""}`, ...styleLabels(job)].filter(Boolean);
       $("#result-stats").textContent =
-        `${job.width}×${job.height} · ${job.steps} steps\nseed ${job.seed} · ${fmtDuration(seconds)}`;
+        `${job.width}×${job.height} · ${job.steps} steps\nseed ${job.seed} · ${fmtDuration(seconds)}` +
+        (meta.length ? `\n${meta.join(" · ")}` : "");
       $("#result-stats").style.whiteSpace = "pre-line";
       const dl = document.createElement("button");
       dl.className = "btn";
@@ -263,7 +340,7 @@
       eyebrow.textContent = "Gone";
       heading.textContent = "Image expired";
       $("#error-text").textContent =
-        "This image hit its five-minute limit and was deleted. Generate it again to get a fresh copy.";
+        "This image hit its five-hour limit and was deleted. Generate it again to get a fresh copy.";
       $("#retry-btn").textContent = "Generate again";
       $("#retry-btn").onclick = () => generate();
       return;
@@ -285,8 +362,8 @@
     if (!job || job.status !== "succeeded") return;
     const remaining = remainingSeconds(job);
     $("#ttl-text").textContent = fmtClock(remaining);
-    badge.classList.toggle("warn", remaining <= 120 && remaining > 30);
-    badge.classList.toggle("crit", remaining <= 30);
+    badge.classList.toggle("warn", remaining <= 1800 && remaining > 600);
+    badge.classList.toggle("crit", remaining <= 600);
   }
 
   function remainingSeconds(job) {
@@ -336,10 +413,32 @@
         card.appendChild(overlay);
       }
 
+      const info = document.createElement("div");
+      info.className = "card-info";
+      const details = document.createElement("div");
+      details.className = "card-details";
+      details.textContent = job.negative
+        ? `${buildDetails(job)} · neg`
+        : buildDetails(job);
+      details.title = job.negative
+        ? `Negative prompt: ${job.negative}`
+        : `No negative prompt. ${buildDetails(job)}`;
+      info.appendChild(details);
+
       const caption = document.createElement("div");
       caption.className = "card-prompt";
       caption.textContent = job.prompt;
-      card.appendChild(caption);
+      caption.title = job.prompt;
+      info.appendChild(caption);
+      card.appendChild(info);
+
+      const rerun = document.createElement("button");
+      rerun.type = "button";
+      rerun.className = "card-rerun";
+      rerun.textContent = "re-run";
+      rerun.title = "Load this image's prompt and settings into the composer";
+      rerun.onclick = () => rerunJob(job);
+      card.appendChild(rerun);
 
       const hit = document.createElement("button");
       hit.className = "card-hit";
@@ -366,17 +465,21 @@
   }
 
   function tick() {
-    const job = activeJob();
-    if (job && job.status === "succeeded") {
-      const remaining = remainingSeconds(job);
-      renderTtl();
-      if (remaining <= 0 && !state.seenExpired.has(job.id)) {
+    // Local expiry: any succeeded job whose countdown hit zero is expired the
+    // instant we see it — no page refresh needed even if the SSE "expired"
+    // event is missed (background tab, reconnect, tunnel hiccup).
+    for (const job of state.jobs.values()) {
+      if (job.status === "succeeded" && !state.seenExpired.has(job.id) && remainingSeconds(job) <= 0) {
         state.seenExpired.add(job.id);
         job.status = "expired";
         job.image_url = null;
-        renderStage();
+        if (job.id === state.activeId) renderStage();
         renderRecent();
       }
+    }
+    const job = activeJob();
+    if (job && job.status === "succeeded") {
+      renderTtl();
     }
     for (const node of $$("[data-expires-for]")) {
       const target = state.jobs.get(node.dataset.expiresFor);
@@ -390,6 +493,10 @@
     if (job && (job.status === "queued" || job.status === "running")) {
       renderStage();
     }
+    // One round-trip per tick while anything is in flight (or SSE is
+    // starved): this is what keeps progress moving when the tunnel
+    // swallows the SSE stream.
+    syncPoll();
   }
 
   // ---------------------------------------------------------------- actions
@@ -401,8 +508,11 @@
       return;
     }
     const { width, height } = dimensions();
+    // The prompt goes up exactly as typed; the chosen look (style presets)
+    // travels as structured `styles` and the quality tier as `quality`, so
+    // a finished image always remembers how it was made.
     const body = {
-      prompt: composedPrompt(),
+      prompt,
       width,
       height,
       steps: Number($("#steps").value) || 8,
@@ -410,6 +520,8 @@
       seed: $("#seed").value === "" ? null : Number($("#seed").value),
       negative_prompt: $("#negative").value || state.config?.defaults?.negative || "",
       lora_strength: Number($("#lora").value) || 1,
+      styles: [...state.styles].join(","),
+      quality: state.quality,
     };
     const button = $("#generate");
     button.disabled = true;
@@ -429,38 +541,160 @@
   }
 
   function loadPrompt(job) {
-    $("#prompt").value = job.prompt;
+    // Jobs created before styles/quality were persisted keep the style
+    // wording inside the prompt text; strip those known suffixes so the
+    // composer shows the idea, not the baked-in look.
+    $("#prompt").value = job.styles ? job.prompt : promptWithoutSuffixes(job.prompt);
     $("#prompt").dispatchEvent(new Event("input"));
-    // The stored prompt already contains any style suffixes; clear the chips so
-    // regenerating does not append them twice.
-    state.styles.clear();
-    for (const chip of $$(".chip")) chip.classList.remove("is-active");
   }
 
+  // Known style-suffix literals, longest first (none is a substring of another).
+  const KNOWN_SUFFIXES = Object.values(STYLE_SUFFIX).sort((a, b) => b.length - a.length);
+  function promptWithoutSuffixes(text) {
+    const literal = (s) => new RegExp(s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    return KNOWN_SUFFIXES
+      .reduce((t, s) => (t || "").replace(literal(s), ""), text || "").trim();
+  }
+
+  // "Try again" on a failed/cancelled job: restore the recipe and fire.
   function regenerate(job) {
+    restoreRecipe(job);
+    generate();
+  }
+
+  // Pick the composer frame/quality that reproduces a job's dimensions
+  // (every UI-generated job maps exactly to one of the offered options).
+  function matchingRatioQuality(job) {
+    if (!job.width || !job.height) return { ratio: "1:1", quality: state.quality };
+    const maxDim = Math.max(job.width, job.height);
+    const quality =
+      Object.keys(QUALITY).find((q) => maxDim <= QUALITY[q]) || "balanced";
+    const target = job.width / job.height;
+    let ratio = "1:1";
+    let best = Infinity;
+    for (const button of $$(".ratio")) {
+      const [rw, rh] = button.dataset.ratio.split(":").map(Number);
+      const dist = Math.abs(rw / rh - target);
+      if (dist < best) { best = dist; ratio = button.dataset.ratio; }
+    }
+    return { ratio, quality };
+  }
+
+  // Restore a job's full recipe — prompt, look (style chips), frame +
+  // quality tier, seed/steps/cfg/LoRA/negative — into the composer. Used by
+  // the card "re-run" button and by the failed-job "Try again".
+  function restoreRecipe(job) {
     loadPrompt(job);
+    const styles = (job.styles || "").split(",").map((s) => s.trim()).filter(Boolean);
+    state.styles.clear();
+    for (const style of styles) {
+      if (STYLE_SUFFIX[style]) state.styles.add(style);
+    }
+    for (const chip of $$(".chip")) {
+      chip.classList.toggle("is-active", state.styles.has(chip.dataset.style));
+    }
     $("#seed").value = job.seed;
     $("#steps").value = job.steps;
     $("#cfg").value = job.cfg;
-    generate();
+    $("#lora").value = job.lora_strength;
+    $("#negative").value = job.negative || "";
+    const inferred = matchingRatioQuality(job);
+    const { ratio } = inferred;
+    const quality = QUALITY[job.quality] ? job.quality : inferred.quality;
+    for (const r of $$(".ratio")) r.classList.toggle("is-active", r.dataset.ratio === ratio);
+    for (const q of $$("#quality button")) q.classList.toggle("is-active", q.dataset.quality === quality);
+    state.ratio = ratio;
+    state.quality = quality;
+    updateSize();
+    document.querySelector(".composer")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    $("#prompt").focus();
+  }
+
+  // From a Recent card: load the recipe and let the user tweak before going.
+  function rerunJob(job) {
+    restoreRecipe(job);
+    toast("Settings loaded. Press Generate to make a new one.");
+  }
+
+  // Fetch the image bytes. Returns a Blob, or null when the file is already
+  // gone. Used by both the manual download button and auto-download.
+  async function fetchImageBlob(job) {
+    const res = await fetch(withKey(imageUrl(job, true)));
+    if (!res.ok) return null;
+    return res.blob();
+  }
+
+  function triggerBrowserDownload(blob, filename) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   }
 
   async function download(job) {
     try {
-      const res = await fetch(withKey(imageUrl(job, true)));
-      if (!res.ok) throw new Error("Image is gone");
-      const blob = await res.blob();
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `kromoss-${job.id}.png`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+      const blob = await fetchImageBlob(job);
+      if (blob == null) throw new Error("Image is gone");
+      triggerBrowserDownload(blob, `kromoss-${job.id}.png`);
       toast("Saved to your downloads.", "good");
     } catch (err) {
       toast(err.message || "Download failed.", "bad");
     }
+  }
+
+  // Auto-download: saves the PNG the moment the job succeeds, so the user
+  // never has to wait on the tab for the file to land. One small drain loop
+  // (no parallel browser saves), and the pending list survives a reload so
+  // a long CPU job that finishes after a refresh is still saved.
+  function queueAutoDownload(job) {
+    if (!state.autoDownload || !job || job.status !== "succeeded") return;
+    if (state.autoDownloadSaved.has(job.id)) return;  // already handled / dedupe
+    if (state.autoDownloadPending.has(job.id)) return; // save in flight
+    state.autoDownloadPending.add(job.id);
+    state.autoDownloadSaved.add(job.id);
+    // No retry on failure: with the 5-hour TTL the image is usually still
+    // fetchable, but re-firing is a duplicate save in the common case, and
+    // one click on Download is always there as a manual fallback.
+    persistAutoDownloadLists();
+    drainAutoDownloads();
+  }
+
+  function drainAutoDownloads() {
+    if (state.autoDownloadDraining) return;
+    state.autoDownloadDraining = true;
+    (async () => {
+      while (state.autoDownload && state.autoDownloadPending.size > 0) {
+        const id = state.autoDownloadPending.values().next().value;
+        const job = state.jobs.get(id);
+        if (!job) {
+          // Job record not loaded yet (just after a reload); the incoming
+          // snapshot/refresh will re-trigger the drain.
+          state.autoDownloadDraining = false;
+          return;
+        }
+        await saveAutoDownload(job);
+      }
+      state.autoDownloadDraining = false;
+      persistAutoDownloadLists();
+    })();
+  }
+
+  async function saveAutoDownload(job) {
+    // Claim the id synchronously so no second save can claim it too.
+    state.autoDownloadPending.delete(job.id);
+    const wasActive = job.id === state.activeId;
+    try {
+      const blob = await fetchImageBlob(job);
+      if (blob == null) throw new Error("image is gone");
+      triggerBrowserDownload(blob, `kromoss-${job.id}.png`);
+      if (wasActive) toast("Auto-saved to your downloads.", "good");
+    } catch (err) {
+      if (wasActive) toast("Auto-download failed: " + (err.message || "image deleted."), "bad");
+    }
+    persistAutoDownloadLists();
   }
 
   async function cancelActive() {
@@ -502,6 +736,7 @@
       state.failedConnects = 0;
     };
     es.onmessage = (event) => {
+      state.lastEventAt = Date.now();
       let payload;
       try {
         payload = JSON.parse(event.data);
@@ -541,7 +776,7 @@
       renderRecent();
       renderEngine();
       if (event.job.status === "succeeded" && previous?.status !== "succeeded") {
-        toast("Image ready. It self-destructs in 5 minutes.", "good");
+        toast("Image ready. It self-destructs in 5 hours.", "good");
       }
       if (event.job.status === "failed") {
         toast("Generation failed.", "bad");
@@ -564,23 +799,97 @@
     }
   }
 
-  async function refresh() {
+  // One round-trip that re-reads the latest state of every job and merges it
+  // into view. `toasts` fires the ready/failed toasts for transitions a
+  // polling pass itself observed (the SSE `job` event that would normally
+  // carry them never arrives when the tunnel swallows the stream).
+  async function pullLatest(toasts) {
+    let data;
     try {
-      const data = await api("/api/generations?limit=24");
-      state.status = data.status;
-      for (const job of data.generations || []) jobReceived(job);
-      if (!state.activeId) {
-        const active = (data.generations || []).find(
-          (j) => j.status === "queued" || j.status === "running"
-        );
-        if (active) state.activeId = active.id;
-      }
-      renderEngine();
-      renderStage();
-      renderRecent();
+      data = await api("/api/generations?limit=24");
     } catch (_) {
-      /* offline; SSE or the next poll will recover */
+      return false; // offline; SSE or the next poll will recover
     }
+    const runningBefore = new Set(
+      [...state.jobs.values()]
+        .filter((j) => j.status === "queued" || j.status === "running")
+        .map((j) => j.id)
+    );
+    state.status = data.status;
+    for (const job of data.generations || []) {
+      const previous = state.jobs.get(job.id);
+      if (
+        toasts &&
+        previous &&
+        runningBefore.has(job.id) &&
+        (job.status === "succeeded" || job.status === "failed" || job.status === "cancelled")
+      ) {
+        // Route through handleEvent BEFORE the map is updated: it fires the
+        // "Image ready" toast / failed toast once, and funnels the auto-
+        // download queue via jobReceived.
+        handleEvent({ type: "job", job });
+      } else {
+        jobReceived(job);
+      }
+    }
+    if (!state.activeId) {
+      const active = (data.generations || []).find(
+        (j) => j.status === "queued" || j.status === "running"
+      );
+      if (active) state.activeId = active.id;
+    }
+    renderEngine();
+    renderStage();
+    renderRecent();
+    return true;
+  }
+
+  function hasActiveJobs() {
+    for (const job of state.jobs.values()) {
+      if (job.status === "queued" || job.status === "running") return true;
+    }
+    return false;
+  }
+
+  // The SSE socket can look "open" while the tunnel buffers everything — no
+  // bytes in means no events and no onerror either, so the old onerror-only
+  // fallback never fired. Any stream silent for >30 s (three missed 15-s
+  // pings plus margin) is treated as starved.
+  function sseStarved() {
+    if (!state.es || state.es.readyState !== 1 /* OPEN */) return true;
+    return state.lastEventAt === 0 || Date.now() - state.lastEventAt > 30000;
+  }
+
+  // The backbone of "live without a refresh": while a job is in flight the
+  // server state is re-read once a second, independent of SSE; when SSE is
+  // starved the same pass keeps status/expiry updates moving (throttled to a
+  // 5 s cadence while idle, so a dead tunnel costs ~1 trivial request/5 s).
+  let syncRunning = false;
+  let lastStarvePollAt = 0;
+  async function syncPoll() {
+    if (syncRunning || document.hidden) return;
+    const jobsActive = hasActiveJobs();
+    if (!jobsActive) {
+      if (!sseStarved()) return;
+      if (Date.now() - lastStarvePollAt < 5000) return;
+      lastStarvePollAt = Date.now();
+    }
+    syncRunning = true;
+    try {
+      await pullLatest(true);
+    } finally {
+      syncRunning = false;
+    }
+  }
+
+  async function refresh() {
+    await pullLatest(true);
+  }
+
+  // The user returned to a throttled/backgrounded tab: pull once now so the
+  // UI is current without a manual reload.
+  function onWake() {
+    syncPoll();
   }
 
   // ---------------------------------------------------------------- UI wiring
@@ -631,6 +940,16 @@
 
     $("#generate").addEventListener("click", generate);
     $("#cancel-btn").addEventListener("click", cancelActive);
+    $("#auto-download").addEventListener("change", (event) => {
+      state.autoDownload = event.target.checked;
+      localStorage.setItem("imagelab.autoDownload", state.autoDownload ? "1" : "0");
+      $("#generate-note").textContent = generateNoteText();
+      if (!state.autoDownload) {
+        // Switching off means "stop saving what is still queued".
+        state.autoDownloadPending.clear();
+        persistAutoDownloadLists();
+      }
+    });
     $("#download-btn").addEventListener("click", () => {
       const job = activeJob();
       if (job) download(job);
@@ -703,9 +1022,8 @@
       `curl -s -o out.png ${location.origin}/api/images/<id>`;
 
     const tools = [
-      ["generate_image", "prompt · width · height · steps · cfg · seed · wait_seconds", "Queue a generation and wait for the PNG. The image comes back inline as base64."],
-      ["get_generation", "id", "Poll a generation; returns the PNG inline while it is alive."],
-      ["list_generations", "limit", "Recent generations with remaining lifetime."],
+      ["generate_image", "prompt · width · height · steps · cfg · seed · wait_seconds", "Generate an image and wait for the PNG. The image comes back inline as base64."],
+      ["get_generation", "id", "Check your generation by id (live progress while running); returns the PNG inline while it is alive."],
       ["cancel_generation", "id", "Stop a queued or running generation."],
       ["engine_info", "—", "Device, queue, defaults, limits, model and TTL."],
     ];
@@ -773,6 +1091,15 @@
       state.config = null;
     }
 
+    // Restore the auto-download state: preference, and any job that was
+    // mid-save when the page reloaded (its file may still be within TTL).
+    state.autoDownloadPending = new Set(
+      safeJsonList(localStorage.getItem("imagelab.autoDownloadPending"))
+    );
+    const autoDownloadBox = $("#auto-download");
+    autoDownloadBox.checked = state.autoDownload;
+    $("#generate-note").textContent = generateNoteText();
+
     if (state.config?.defaults) {
       $("#steps").value = state.config.defaults.steps;
       $("#cfg").value = state.config.defaults.cfg;
@@ -790,10 +1117,16 @@
     updateSize();
     await refresh();
     connect();
+    // Jobs are hydrated; pick up any auto-save that a reload interrupted.
+    if (state.autoDownload && state.autoDownloadPending.size > 0) drainAutoDownloads();
     setInterval(tick, 1000);
     setInterval(() => {
       if (!state.status || !state.status.ready) refresh();
     }, 20000);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) onWake();
+    });
+    window.addEventListener("focus", onWake);
   }
 
   boot();

@@ -1,4 +1,4 @@
-"""Job queue, ComfyUI orchestration, and the 5-minute image reaper."""
+"""Job queue, ComfyUI orchestration, and the image TTL reaper."""
 
 from __future__ import annotations
 
@@ -15,19 +15,20 @@ from typing import Any, AsyncIterator
 from .comfy import ComfyClient, ComfyError, extract_image
 from .config import Settings
 from .store import ACTIVE, Store
-from .workflow import build_workflow, estimated_seconds
+from .workflow import build_workflow, estimated_seconds, render_prompt
 
 log = logging.getLogger("imagelab.engine")
 
 
 class Engine:
-    def __init__(self, settings: Settings, store: Store):
+    def __init__(self, settings: Settings, store: Store, prompt_vanish_seconds: float = 60.0):
         self.settings = settings
         self.store = store
         self.comfy = ComfyClient(settings.comfy_url)
         self.ready = False
         self.last_error: str | None = None
         self.info: dict[str, Any] = {}
+        self.prompt_vanish_seconds = prompt_vanish_seconds
         self._subs: set[asyncio.Queue] = set()
         self._waiters: dict[str, asyncio.Event] = {}
         self._stopping = asyncio.Event()
@@ -121,10 +122,26 @@ class Engine:
 
     def _eta(self, job: dict[str, Any]) -> int:
         if job["status"] == "queued":
-            ahead = self.store.queue_position(job["id"])
-            return int(ahead * estimated_seconds(
-                self.settings, job["width"], job["height"], job["steps"]
-            ))
+            # Sum the remaining work queued ahead (plus the running job).
+            running_seconds = 0.0
+            ahead_seconds = 0.0
+            for other in self.store.active():
+                if other["id"] == job["id"]:
+                    continue
+                if other["status"] == "queued":
+                    ahead_seconds += estimated_seconds(
+                        self.settings, other["width"], other["height"], other["steps"]
+                    )
+                    continue
+                running_start = other.get("started_at") or time.time()
+                if other.get("progress") and other["progress"] > 0.03:
+                    base = (time.time() - running_start) / other["progress"]
+                else:
+                    base = estimated_seconds(
+                        self.settings, other["width"], other["height"], other["steps"]
+                    )
+                running_seconds = max(0.0, time.time() - running_start + base * (1 - other["progress"]))
+            return int(min(3600, ahead_seconds + running_seconds))
         elapsed = max(0.0, time.time() - (job.get("started_at") or time.time()))
         progress = float(job.get("progress") or 0)
         if progress > 0.03:
@@ -145,6 +162,8 @@ class Engine:
         seed: int | None,
         lora_strength: float | None,
         source: str = "web",
+        styles: str = "",
+        quality: str | None = None,
     ) -> dict[str, Any]:
         prompt = prompt.strip()
         if not prompt:
@@ -178,6 +197,8 @@ class Engine:
             "bytes": None,
             "prompt_id": None,
             "source": source,
+            "styles": (styles or "").strip(),
+            "quality": (quality or "").strip() or None,
         }
         job = self.store.create(job)
         self.publish({"type": "job", "job": self.public_job(job)})
@@ -300,9 +321,11 @@ class Engine:
     async def _run_job(self, job: dict[str, Any]) -> None:
         settings = self.settings
         job_id = job["id"]
+        # The stored prompt is the idea; the saved style presets are folded in
+        # here so the text encoder sees the look the user picked.
         graph = build_workflow(
             settings,
-            prompt=job["prompt"],
+            prompt=render_prompt(job["prompt"], job.get("styles") or ""),
             negative=job["negative"],
             width=job["width"],
             height=job["height"],
@@ -335,6 +358,18 @@ class Engine:
             )
 
             deadline = time.time() + settings.job_timeout_seconds
+            # A prompt accepted by ComfyUI can still die without a history
+            # entry — proved live: a gateway restart interrupted the queue,
+            # re-queued the job and resubmitted, and the interrupt killed the
+            # fresh prompt (before or right after it hit the queue). The old
+            # behavior then spun this loop for the full job timeout, jamming
+            # the single worker. Rule: a healthy prompt is in the queue or in
+            # history within seconds, so 60 s of being in neither means it
+            # was lost; fail the job fast and free the worker.
+            first_seen = time.time()
+            last_seen = first_seen
+            seen_in_queue = False
+            deadline = time.time() + settings.job_timeout_seconds
             entry: dict[str, Any] | None = None
             while time.time() < deadline:
                 current = self.store.get(job_id)
@@ -345,6 +380,21 @@ class Engine:
                 entry = await self.comfy.history(prompt_id)
                 if entry is not None:
                     break
+                try:
+                    queue = await self.comfy.queue()
+                    ids = {p[1] for p in queue.get("queue_running", [])}
+                    ids.update(p[1] for p in queue.get("queue_pending", []))
+                except Exception:  # noqa: BLE001
+                    ids = set()
+                if prompt_id in ids:
+                    seen_in_queue = True
+                    last_seen = time.time()
+                elif time.time() - (last_seen if seen_in_queue else first_seen) > self.prompt_vanish_seconds:
+                    raise ComfyError(
+                        "ComfyUI lost the workflow: it is in neither queue nor history "
+                        "after %ds with no output (killed, e.g. by an interrupt); "
+                        "nothing was generated" % int(self.prompt_vanish_seconds)
+                    )
                 await asyncio.sleep(1.0)
 
             if entry is None:

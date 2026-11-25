@@ -3,7 +3,7 @@ PORT ?= 8080
 BASE ?= http://127.0.0.1:$(PORT)
 PY ?= python3
 
-.PHONY: help install test run deploy setup models tunnel trial logs status clean
+.PHONY: help install test run deploy setup models tunnel tunnel-platform trial logs status clean
 
 help:
 	@echo "ImageLab — Kromoss on kube-labs"
@@ -14,7 +14,7 @@ help:
 	@echo "  make setup     provision the remote machine (torch, ComfyUI, GGUF node)"
 	@echo "  make models    download the CPU profile weights on the remote machine"
 	@echo "  make deploy    upload this repo and install/restart both services"
-	@echo "  make tunnel    print the public URL for the UI"
+	@echo "  make tunnel    publish the UI on a Cloudflare quick tunnel"
 	@echo "  make trial     submit one image and time it"
 	@echo "  make logs      follow the gateway log on the remote machine"
 	@echo "  make status    show engine health"
@@ -46,6 +46,9 @@ deploy:
 	./scripts/deploy.sh $(MACHINE)
 
 tunnel:
+	./scripts/cloudflared_tunnel.sh $(MACHINE)
+
+tunnel-platform:
 	./scripts/tunnel.sh $(MACHINE) $(PORT)
 
 trial:

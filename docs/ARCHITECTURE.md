@@ -3,7 +3,7 @@
 ImageLab is two processes and one static directory.
 
 ```
-systemd: comfyui.service     systemd: imagelab.service
+systemd: comfyui.service     systemd: imagelab.service + imagelab-tunnel.service
 ┌──────────────────────┐     ┌──────────────────────────────────────┐
 │ ComfyUI :8188        │◄────│ FastAPI :8080                        │
 │ headless, CPU        │ HTTP│ queue worker · SQLite · SSE · reaper │
@@ -89,7 +89,7 @@ Two details matter on CPU:
 
 **CFG 1 skips the negative branch.** With the 8-step DMD2 LoRA, `cfg=1` is the intended setting. At CFG 1 the negative conditioning is never evaluated, but a naive graph still runs the 9B text encoder twice. The builder uses `ConditioningZeroOut` on the positive conditioning instead of a second `CLIPTextEncode`, so the encoder runs once. When `cfg > 1`, it emits a real negative `CLIPTextEncode` and passes the user's negative prompt.
 
-**GGUF is the CPU path.** `UnetLoaderGGUF` comes from `city96/ComfyUI-GGUF`. The INT8 ConvRot safetensors file selects int8 attention per block; that kernel is CUDA/HIP only. On CPU it would fall back to dequantization and lose to ggml Q4 on both speed and memory bandwidth. The profile switch is one environment variable (`IMAGELAB_UNET_LOADER`).
+**GGUF is the CPU path.** `UnetLoaderGGUF` comes from `molbal/ComfyUI-GGUF` ("comfyui-gguf-reboot"), a fork of `city96/ComfyUI-GGUF` that accepts the `moss_image` architecture declared by Kromoss GGUF files. The node name is the same, so the graph stays portable. The INT8 ConvRot safetensors file selects int8 attention per block; that kernel is CUDA/HIP only. On CPU it would fall back to dequantization and lose to ggml Q4 on both speed and memory bandwidth. The profile switch is one environment variable (`IMAGELAB_UNET_LOADER`).
 
 Dimensions are clamped to `[min_dimension, max_dimension]` and rounded down to a multiple of 16, which the FLUX.2 latent expects.
 
@@ -111,7 +111,7 @@ The gateway copies the ComfyUI output into `data/images` and immediately deletes
 
 ## TTL and deletion
 
-`expires_at` is set once, on success: `finished_at + IMAGELAB_TTL_SECONDS` (300 by default). The reaper runs every two seconds:
+`expires_at` is set once, on success: `finished_at + IMAGELAB_TTL_SECONDS` (18000 by default, i.e. five hours). The reaper runs every two seconds:
 
 ```python
 for job in store.expire_due():          # UPDATE … WHERE expires_at <= now
@@ -133,7 +133,9 @@ The UI never trusts the server clock alone: it receives `expires_in` and counts 
 - `status`: engine probe result every five seconds;
 - a `: ping` comment every 15 seconds to keep proxies from closing the stream.
 
-Subscribers are in-memory `asyncio.Queue`s with a bounded size; a slow client drops events rather than backpressuring the engine. The UI falls back to polling `/api/generations` if SSE fails repeatedly.
+Subscribers are in-memory `asyncio.Queue`s with a bounded size; a slow client drops events rather than backpressuring the engine. The UI does not rely on SSE alone: while any job is queued/running it re-reads `/api/generations` once a second, and an otherwise-silent stream (nothing received for 30 s — a Cloudflare quick tunnel can hold the connection open without forwarding a single byte, leaving `EventSource` in the "open" state with no error) is treated as starved and polls at a 5 s cadence. Ready/failed transitions observed by polling are routed through the same handler as the SSE `job` event, so toasts and the auto-download queue fire exactly once either way.
+
+The worker also detects a **lost prompt**: a job whose ComfyUI prompt is in neither the ComfyUI queue nor its history for 60 s without any output — e.g. killed by the `interrupt` a gateway restart sends when it re-queues an in-flight job — is failed fast instead of spinning to the full `JOB_TIMEOUT`, which previously jammed the single worker for up to an hour and blocked every job behind it.
 
 ## Security model
 
@@ -142,6 +144,20 @@ Subscribers are in-memory `asyncio.Queue`s with a bounded size; a slow client dr
 - The image endpoint is under the same middleware, so a key protects the bytes as well as the metadata.
 - CORS defaults to `*` for convenience; tighten `IMAGELAB_CORS_ORIGINS` for a shared deployment.
 - Prompts and images are stored on the machine only. There is no telemetry and no outbound call except to ComfyUI on localhost.
+
+## Publishing
+
+`make tunnel` installs `cloudflared` on the machine and runs it as
+`imagelab-tunnel.service` against `http://127.0.0.1:8080`. A quick tunnel needs
+no Cloudflare account, so the gateway never has to expose port 8080 or hold a
+Cloudflare credential. The hostname is ephemeral: it changes when the tunnel
+restarts, which is why the installer writes the current URL into
+`IMAGELAB_PUBLIC_URL` and restarts the gateway.
+
+The tunnel is a real public listener. With no `IMAGELAB_API_KEY`, anyone who
+learns the hostname can use the API, MCP tools and image bytes. Set a key before
+sharing the URL, or use a named tunnel with an access policy and a stable
+hostname.
 
 ## Failure modes
 
@@ -152,7 +168,7 @@ Subscribers are in-memory `asyncio.Queue`s with a bounded size; a slow client dr
 | `ComfyUI rejected the workflow` | missing node/file | Job fails with the node error text |
 | WS drops | proxy/idle | Polling still completes the job |
 | Gateway restarts | deploy/crash | Running jobs requeued; images keep their TTL |
-| Disk full | too many images | TTL bounds live images to ~5 min of output |
+| Disk full | too many images | TTL bounds live images to ~5 hours of output |
 
 The gateway is intentionally forgiving: a failed job records the exception and stays visible in the UI with a retry button. It never blocks the queue.
 
